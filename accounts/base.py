@@ -1,0 +1,29 @@
+# accounts/base.py
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Tuple, Optional
+
+class AccountBase(ABC):
+    """
+    账户抽象：杠杆、余额、持仓
+    """
+    def __init__(self, leverage: int = 10):
+        super().__init__()
+        self.account_balance: float = 0.0      # USDT 可用余额
+        self.leverage: int = leverage          # 默认杠杆倍数
+        self.position_inst_id: str = ""        # 当前持仓 instId（你策略里“单币种持仓”会很有用）
+
+    @abstractmethod
+    def set_leverage(self, inst_id: str, lever: str, mgn_mode: str, pos_side: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_usdt_free(self) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_position(self, inst_id: str, pos_side: str) -> Tuple[float, float]:
+        """
+        返回 (availPos, avgPx)
+        """
+        raise NotImplementedError
