@@ -36,6 +36,7 @@ class OkxAccount(AccountBase):
         # 可选：启动时刷新一次余额
         try:
             self.get_usdt_free()
+            self.get_account_equity()
         except Exception:
             pass
 
@@ -76,6 +77,29 @@ class OkxAccount(AccountBase):
 
         self.account_balance = usdt_free
         return usdt_free
+    
+    def get_account_equity(self) -> float:
+        # 获取 USDT 总权益（含已开仓、浮盈亏）
+        resp = require_ok(self.acc.get_account_balance(), "get_account_balance")
+        data = resp.get("data", [])
+        if not data:
+            self.account_equity = 0.0
+            return 0.0
+
+        details = data[0].get("details") or data[0].get("balData") or []
+        equity = 0.0
+        for d in details:
+            if d.get("ccy") == "USDT":
+                if d.get("eq") is not None:
+                    try:
+                        equity = float(d["eq"])
+                    except Exception:
+                        equity = 0.0
+                break
+
+        self.account_equity = equity
+        return equity
+
 
     def get_position(self, inst_id: str, pos_side: str) -> Tuple[float, float]:
         # 获取指定币种持仓信息

@@ -10,6 +10,7 @@ class AccountBase(ABC):
     def __init__(self, leverage: int = 10):
         super().__init__()
         self.account_balance: float = 0.0      # USDT 可用余额
+        self.account_equity: float = 0.0    # USDT 总权益（含持仓、浮盈亏）
         self.leverage: int = leverage          # 默认杠杆倍数
         self.position_inst_id: str = ""        # 当前持仓 instId（你策略里“单币种持仓”会很有用）
 
@@ -19,6 +20,11 @@ class AccountBase(ABC):
 
     @abstractmethod
     def get_usdt_free(self) -> float:
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_account_equity(self) -> float:
+        """返回 USDT 总权益（含持仓）"""
         raise NotImplementedError
 
     @abstractmethod

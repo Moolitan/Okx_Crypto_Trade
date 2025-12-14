@@ -8,6 +8,8 @@ def main():
     # exchange = OkxSdkExchange(flag=FLAG)
     account = OkxAccount(flag=FLAG)
     usdt_free = account.get_usdt_free()
+    equity = account.get_account_equity()
+    print(f"账户 USDT 总权益: {equity}")
     print(f"账户 USDT 可用余额: {usdt_free}")
 
     # 换策略只要替换这里：比如 MomentumV2(), MeanReversion(), GridStrategy()...
