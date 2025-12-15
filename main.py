@@ -1,7 +1,7 @@
 # main.py
 from exchanges import OkxSdkExchange
 from accounts import OkxAccount
-from strategies import MomentumV1
+from Analyze import MomentumV1
 
 def main():
     FLAG = "0"  # 0=实盘, 1=模拟盘（按你SDK）
@@ -9,6 +9,8 @@ def main():
     account = OkxAccount(flag=FLAG)
     usdt_free = account.get_usdt_free()
     equity = account.get_account_equity()
+    leverage = account.leverage
+    print(f"账户杠杆倍数: {leverage}")
     print(f"账户 USDT 总权益: {equity}")
     print(f"账户 USDT 可用余额: {usdt_free}")
 
