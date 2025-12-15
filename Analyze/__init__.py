@@ -1,2 +1,2 @@
 from .base import StrategyBase
-from .momentum import MomentumV1
+from ..Trade.momentum import MomentumV1

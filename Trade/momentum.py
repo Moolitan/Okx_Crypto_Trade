@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-from .base import StrategyBase
+from ..Analyze.base import StrategyBase
 
 
 @dataclass
