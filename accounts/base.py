@@ -33,3 +33,17 @@ class AccountBase(ABC):
         返回 (availPos, avgPx)
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def get_all_positions(self, inst_type: str, simple: bool = False) -> Any:
+        """
+        返回所有持仓列表（raw data or simple list）
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def print_positions_summary(self) -> None:
+        """
+        打印当前持仓汇总信息
+        """
+        raise NotImplementedError

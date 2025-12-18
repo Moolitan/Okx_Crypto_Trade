@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-from ..Analyze.base import StrategyBase
+from .base import ExchangeBase
 
 
 @dataclass
@@ -44,7 +44,7 @@ def calculate_volume_sma(df: pd.DataFrame, length: int) -> float:
     return float(df["Volume"].rolling(window=length).mean().iloc[-1])
 
 
-class MomentumV1(StrategyBase):
+class MomentumV1(ExchangeBase):
     """
     你现在这套：
     - TopN 涨幅榜（USDT 永续）

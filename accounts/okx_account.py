@@ -121,3 +121,58 @@ class OkxAccount(AccountBase):
                 self.position_inst_id = ""
 
         return avail, avgpx
+    
+    def get_all_positions(self, inst_type: str = None, simple: bool = False) -> list[dict]:
+            """
+            获取当前账户的所有持仓信息。
+            
+            :param inst_type: 可选筛选，例如 'SWAP'(永续合约), 'FUTURES'(交割合约)
+            :param simple: 如果为 True，只返回包含核心字段的精简列表；如果为 False，返回原始详细数据
+            :return: 持仓信息列表
+            """
+            kwargs = {}
+            if inst_type:
+                kwargs['instType'] = inst_type
+
+            # 调用 API
+            resp = require_ok(self.acc.get_positions(**kwargs), "get_all_positions")
+            raw_data = resp.get("data", [])
+
+            # 如果开启了 simple 模式，进行数据清洗
+            if simple:
+                clean_list = []
+                for p in raw_data:
+                    clean_list.append({
+                        "instId": p.get("instId"),      # 币种名
+                        "posSide": p.get("posSide"),    # 方向: long/short/net
+                        "pos": p.get("pos"),            # 持仓数量
+                        "avgPx": p.get("avgPx"),        # 开仓均价
+                        "upl": p.get("upl"),            # 未实现盈亏
+                        "uplRatio": p.get("uplRatio")   # 收益率
+                    })
+                return clean_list
+            return raw_data
+    
+    def print_positions_summary(self):
+        """
+        (辅助方法) 打印当前所有持仓的简报，用于调试
+        """
+        positions = self.get_all_positions()
+        if not positions:
+            print(">>> 当前无持仓")
+            return
+
+        print(f">>> 当前持仓列表 (共 {len(positions)} 个):")
+        print(f"{'合约(InstId)':<20} {'方向':<6} {'持仓量(张/币)':<12} {'均价':<10} {'未实现盈亏(UPL)':<15}")
+        print("-" * 70)
+        
+        for p in positions:
+            inst_id = p.get('instId')
+            pos_side = p.get('posSide') # long, short, net
+            pos_sz = p.get('pos')       # 持仓数量
+            avg_px = p.get('avgPx')
+            upl = p.get('upl')          # 未实现盈亏
+            
+            print(f"{inst_id:<20} {pos_side:<6} {pos_sz:<12} {avg_px:<10} {upl:<15}")
+        print("-" * 70)
+

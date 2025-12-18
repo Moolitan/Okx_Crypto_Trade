@@ -3,8 +3,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from exchanges.base import ExchangeBase
-from accounts.base import AccountBase
+from Trade.base import ExchangeBase
+from Accounts.base import AccountBase
 
 class StrategyBase(ABC):
     """
