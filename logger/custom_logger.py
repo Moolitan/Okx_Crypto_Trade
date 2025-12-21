@@ -1,26 +1,85 @@
-import logging
-import os
+# -*- coding: utf-8 -*-
+"""
+Custom logger utility.
 
-def get_logger(name):
-    # Use the file name instead of the module name
-    logger_name = os.path.basename(name).split('.')[0]
-    
-    # Configure logger
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.DEBUG)  # Set the logging level to debug
+Provides a unified logging interface for consistent console output
+across different modules.
+"""
 
-    # Create console handler and set level to debug
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+import time
+from typing import Optional
 
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # Add formatter to ch
-    ch.setFormatter(formatter)
+class CustomLogger:
+    """
+    Custom logger class.
 
-    # Add ch to logger
-    if not logger.handlers:
-        logger.addHandler(ch)
-    
-    return logger
+    Provides a simple, unified logging interface that can be reused
+    across different modules.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        """
+        Initialize the logger.
+
+        Args:
+            name: Optional logger name used to identify the log source.
+        """
+        self.name = name
+
+    def log(self, message: str):
+        """
+        Core logging method.
+
+        Args:
+            message: Log message to output.
+        """
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        if self.name:
+            print(f"[{timestamp}] [{self.name}] {message}", flush=True)
+        else:
+            print(f"[{timestamp}] {message}", flush=True)
+
+    def info(self, message: str):
+        """
+        Info-level log.
+        """
+        self.log(f"ℹ️ {message}")
+
+    def warning(self, message: str):
+        """
+        Warning-level log.
+        """
+        self.log(f"⚠️ {message}")
+
+    def error(self, message: str):
+        """
+        Error-level log.
+        """
+        self.log(f"❌ {message}")
+
+    def success(self, message: str):
+        """
+        Success-level log.
+        """
+        self.log(f"✅ {message}")
+
+    def debug(self, message: str):
+        """
+        Debug-level log.
+        """
+        self.log(f"🔍 {message}")
+
+
+# Global default logger instance for convenience
+_default_logger = CustomLogger()
+
+
+def log(message: str):
+    """
+    Global logging function (backward compatible).
+
+    Args:
+        message: Log message to output.
+    """
+    _default_logger.log(message)
