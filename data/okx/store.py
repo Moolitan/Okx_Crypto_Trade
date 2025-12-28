@@ -8,7 +8,7 @@ from typing import Optional, List
 
 import pandas as pd
 import numpy as np
-
+from .path import OKX_DUCKDB_PATH
 try:
     import duckdb
 except ImportError as e:
@@ -67,7 +67,7 @@ class OkxPersistStore:
     Persistence layer (DuckDB as primary store, optional Parquet export).
     """
 
-    path: str = "./data/okx.duckdb"
+    path: Optional[str] = None
     parquet_dir: Optional[str] = None
     read_only: bool = False
     
@@ -75,6 +75,7 @@ class OkxPersistStore:
 
     def __post_init__(self):
         _ensure_duckdb()
+        self.path = str(self.path or OKX_DUCKDB_PATH)
         if not self.read_only:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             if self.parquet_dir:

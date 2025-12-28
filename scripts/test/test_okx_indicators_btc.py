@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.okx.store import OkxPersistStore
 from data.okx.indicators import QuantitativeIndicator
-
+from data.okx.path import OKX_DUCKDB_PATH
 # OKX SDK (you already use okx.MarketData elsewhere)
 import okx.MarketData as MarketData
 
@@ -90,7 +90,7 @@ def ensure_duckdb_has_data(
 def main():
     symbol = os.getenv("OKX_SYMBOL", "BTC-USDT")
     bar = os.getenv("OKX_BAR", "1m")
-    db_path = os.getenv("OKX_DUCKDB", "./data/okx.duckdb")
+    db_path = os.getenv("OKX_DUCKDB", str(OKX_DUCKDB_PATH))
     limit = int(os.getenv("OKX_LIMIT", "300"))
 
     print("\n==============================")
