@@ -54,7 +54,8 @@ def _to_ts_ms(series: pd.Series) -> pd.Series:
     # 3. Strings / Objects (ISO format parsing)
     dt = pd.to_datetime(series, utc=True, errors="coerce")
     # Handle failures (Nat) by defaulting to 0 or keeping NaT logic (here we force int)
-    return (dt.view("int64") // 1_000_000).fillna(0).astype("int64")
+    dt = pd.to_datetime(series, utc=True, errors="coerce")
+    return (dt.astype("int64") // 1_000_000).fillna(0).astype("int64")
 
 
 def _ts_ms_to_iso(ts_ms: pd.Series) -> pd.Series:
