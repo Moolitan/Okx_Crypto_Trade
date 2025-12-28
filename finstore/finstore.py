@@ -7,13 +7,21 @@ from tqdm import tqdm
 import sys
 
 # ------------------------------------------------------------
-# 说明：
-# 这份代码实现的是一个本地金融数据仓库（Finstore）。
-# ✅ 只负责：存储 / 读取 / 合并 / 批量计算技术指标 / 流式落盘
-# ❌ 不负责：调用任何交易所 API（REST/WebSocket连接、鉴权、请求等都不在这里）
+# Notes:
+# This code implements a local financial data warehouse (Finstore).
 #
-# 换句话说：交易所数据的“采集层”应该在别的模块里实现，
-# 采集层把 message(dict) 传给 Stream.save_trade_data()，这里负责存盘。
+# ✅ Responsibilities:
+# - Store / read / merge local market data
+# - Batch compute technical indicators
+# - Stream ingestion to local storage (append + dedup)
+#
+# ❌ Not responsible for:
+# - Any exchange API calls (REST/WebSocket connections, auth, requests, etc.)
+#
+# In other words:
+# The "data collection layer" (exchange clients) should live elsewhere.
+# That layer passes message(dict) into Stream.save_trade_data(),
+# and this module handles persistence only.
 # ------------------------------------------------------------
 
 # Add the parent directory to the Python path
@@ -22,9 +30,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class Finstore:
     """
-    Finstore：本地金融数据存储与读取工具
+    Finstore: a local storage and retrieval utility for financial data.
 
-    目录结构（默认）：
+    Default directory layout:
     database/finstore/
       market_name=<market>/
         timeframe=<timeframe>/
@@ -33,13 +41,13 @@ class Finstore:
             technical_indicators.parquet
             raw_data.parquet
 
-    参数说明：
-    - market_name: 市场名称（比如 binance / okx / stocks 等，完全由你定义）
-    - timeframe : 周期（1m/5m/1h/1d...）
-    - base_directory: 根目录
-    - enable_append: 是否对已有 parquet 追加（增量写入）
-    - limit_data_lookback: 指标计算时只取最近 N 条（加速）
-    - pair: 可选，用于某些市场符号组织方式（如 folder/pair）
+    Parameters:
+    - market_name: market identifier (e.g., binance / okx / stocks; user-defined)
+    - timeframe: bar interval (1m/5m/1h/1d...)
+    - base_directory: root directory path
+    - enable_append: whether to append to existing parquet (incremental write)
+    - limit_data_lookback: compute indicators using only last N bars (speed-up)
+    - pair: optional folder suffix for markets that organize symbols as folder/pair
     """
 
     def __init__(
@@ -58,16 +66,14 @@ class Finstore:
         self.limit_data_lookback = limit_data_lookback
         self.pair = pair
 
-        # 分成三个“子模块”，职责拆分清晰：
         self.read = self.Read(self)
         self.write = self.Write(self)
         self.stream = self.Stream(self)
 
-        # 调试：列一下目录里有哪些 symbol 文件夹
         self.list_items_in_dir()
 
     def list_items_in_dir(self):
-        """列出 market + timeframe 目录下的所有子项（调试用）"""
+        """List all sub-items under market+timeframe directory (debug helper)."""
         dir_path = os.path.join(
             self.base_directory,
             f"market_name={self.market_name}",
@@ -83,7 +89,7 @@ class Finstore:
             print(f"An error occurred: {e}")
 
     # ============================================================
-    # Read：读取模块（只读本地 parquet，不会请求交易所）
+    # Read: read-only module (local parquet only, no exchange requests)
     # ============================================================
     class Read:
         def __init__(self, finstore_instance):
@@ -94,12 +100,12 @@ class Finstore:
 
         def symbol(self, symbol: str):
             """
-            读取某个 symbol 的 OHLCV parquet（ohlcv_data.parquet）
+            Load OHLCV parquet for a single symbol (ohlcv_data.parquet).
 
-            使用 DuckDB 读取 parquet 的好处：
-            - 可直接 SQL 读 parquet（无需先导入数据库）
-            - 读取时可多线程（PRAGMA threads=4）
-            - 对分析型查询很友好
+            Why DuckDB for parquet reading:
+            - Query parquet via SQL without importing into a DB
+            - Multi-threaded scanning (PRAGMA threads=4)
+            - Friendly for analytical queries
             """
             file_path = os.path.join(
                 self.base_directory,
@@ -121,13 +127,15 @@ class Finstore:
 
         def merged_df(self, symbol: str):
             """
-            读取并合并：
+            Load and merge:
             - ohlcv_data.parquet
             - technical_indicators.parquet
 
-            technical_indicators.parquet 是“长表”：
-              timestamp | indicator_name | indicator_value
-            这里会 pivot 成“宽表”，让每个指标变成一列，然后按 timestamp merge 到 OHLCV。
+            technical_indicators.parquet is a "long" table:
+            timestamp | indicator_name | indicator_value
+
+            This method pivots it into a "wide" table where each indicator is a column,
+            then merges by timestamp.
             """
             file_path = os.path.join(
                 self.base_directory,
@@ -159,17 +167,17 @@ class Finstore:
                 f"SELECT * FROM read_parquet('{technical_indicators_path}')"
             ).fetchdf()
 
-            # 去重：同一 timestamp + indicator_name 保留一条
+            # Deduplicate: keep one record per timestamp + indicator_name
             technical_indicators_df = technical_indicators_df.drop_duplicates(subset=['timestamp', 'indicator_name'])
 
-            # pivot：长表 -> 宽表
+            # pivot: long format -> wide format
             technical_indicators_df = technical_indicators_df.pivot(
                 index='timestamp',
                 columns='indicator_name',
                 values='indicator_value'
             ).reset_index()
 
-            # merge：把指标列合并到 OHLCV
+            # merge: merge indicator columns into OHLCV
             merged_df = df.merge(technical_indicators_df, on='timestamp', how='left')
 
             conn.close()
@@ -178,12 +186,12 @@ class Finstore:
 
         def symbol_list(self, symbol_list: list, merged_dataframe: bool = False):
             """
-            并行读取多个 symbol
-            返回 {symbol: df}
+            Read multiple symbols in parallel.
+            Returns {symbol: df}
 
-            注意：
-            - 这里使用 ProcessPoolExecutor 多进程并行
-            - merged_dataframe=True 时读取合并后的大表（OHLCV+指标）
+            Note:
+            - Uses ProcessPoolExecutor for multi-process parallelism.
+            - When merged_dataframe=True, reads the merged big table (OHLCV+indicators).
             """
             results = {}
             with ProcessPoolExecutor() as executor:
@@ -204,7 +212,7 @@ class Finstore:
 
         def get_symbol_list(self):
             """
-            获取当前 market+timeframe 下本地已有的 symbol 列表（通过目录枚举）
+            Get the list of locally available symbols under current market+timeframe (via directory enumeration).
             """
             file_path = os.path.join(
                 self.base_directory,
@@ -214,7 +222,7 @@ class Finstore:
             if not os.path.isdir(file_path):
                 raise FileNotFoundError(f"Directory not found for market '{self.market_name}' at '{file_path}'")
 
-            # pair 的用途：如果你目录层级需要拼接成 folder/pair，就在这里做
+            # Usage of 'pair': If your directory structure requires concatenation like folder/pair, handle it here.
             if self.pair != '':
                 symbol_list = [
                     str(folder) + '/' + str(self.pair)
@@ -230,17 +238,17 @@ class Finstore:
             return symbol_list
 
     # ============================================================
-    # Write：写入模块（只写本地 parquet，不会请求交易所）
+    # Write: Writing module (Local parquet only, does not request exchange)
     # ============================================================
     class Write:
         """
-        写入模块：
-        - 写 OHLCV 到 ohlcv_data.parquet
-        - 写技术指标到 technical_indicators.parquet
+        Write module:
+        - Write OHLCV to ohlcv_data.parquet
+        - Write technical indicators to technical_indicators.parquet
 
-        enable_append=True 时支持增量追加：
-        - 会先读旧 parquet 再 concat 新数据再去重
-        （数据量大时，这种“读全量再写回”会变慢，是可优化点）
+        Supports incremental append when enable_append=True:
+        - Reads old parquet, concats new data, then deduplicates.
+        (With large data, this 'read full then write back' approach slows down and is an optimization point).
         """
 
         def __init__(self, finstore_instance):
@@ -252,7 +260,7 @@ class Finstore:
 
         def symbol(self, symbol: str, data: pd.DataFrame):
             """
-            写入某个 symbol 的 OHLCV 数据到 parquet
+            Write OHLCV data for a specific symbol to parquet
             """
             dir_path = os.path.join(
                 self.base_directory,
@@ -263,7 +271,7 @@ class Finstore:
             os.makedirs(dir_path, exist_ok=True)
             file_path = os.path.join(dir_path, 'ohlcv_data.parquet')
 
-            # 增量追加：读旧数据 + 拼接 + timestamp 去重
+            # Incremental append: read old data + concat + deduplicate by timestamp
             if os.path.isfile(file_path) and self.enable_append:
                 existing_df = pd.read_parquet(file_path)
                 data = pd.concat([existing_df, data], ignore_index=True)
@@ -273,7 +281,7 @@ class Finstore:
 
         def symbol_list(self, data_ohlcv: dict):
             """
-            并行写入多个 symbol 的 OHLCV
+            Write OHLCV for multiple symbols in parallel.
             data_ohlcv: {symbol: df}
             """
             with ProcessPoolExecutor() as executor:
@@ -289,9 +297,9 @@ class Finstore:
 
         def technical_data(self, symbol: str, indicators_df: pd.DataFrame):
             """
-            写技术指标到 technical_indicators.parquet
+            Write technical indicators to technical_indicators.parquet.
 
-            要求 indicators_df 结构类似：
+            Requires indicators_df structure like:
               timestamp | indicator_name | indicator_value
             """
             file_path = os.path.join(
@@ -303,15 +311,15 @@ class Finstore:
             )
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-            # 补齐元信息
+            # Fill metadata
             indicators_df['symbol'] = symbol
             indicators_df['timeframe'] = self.timeframe
 
-            # 标准化字段顺序
+            # Standardize column order
             formatted_df = indicators_df[['symbol', 'timeframe', 'timestamp', 'indicator_name', 'indicator_value']]
             formatted_df.loc[:, 'indicator_value'] = formatted_df['indicator_value'].astype(float)
 
-            # 增量追加：读旧数据 + 拼接 + 去重
+            # Incremental append: read old data + concat + deduplicate
             if os.path.isfile(file_path) and self.enable_append:
                 existing_df = pd.read_parquet(file_path)
                 formatted_df = pd.concat([existing_df, formatted_df], ignore_index=True)
@@ -323,8 +331,8 @@ class Finstore:
 
         def process_indicator(self, symbol, df, calculation_func, calculation_kwargs):
             """
-            单个 symbol 的指标计算与写入
-            - limit_data_lookback > 0 时只使用最近 N 条 K线数据算指标
+            Indicator calculation and writing for a single symbol.
+            - When limit_data_lookback > 0, only use the last N bars of K-line data to calculate indicators.
             """
             try:
                 if self.limit_data_lookback > 0:
@@ -338,9 +346,9 @@ class Finstore:
 
         def indicator(self, ohlcv_data: dict, calculation_func, **calculation_kwargs):
             """
-            批量计算并写入技术指标：
+            Batch calculate and write technical indicators:
             - ohlcv_data: {symbol: df}
-            - calculation_func: 你的指标函数（应返回 timestamp/indicator_name/indicator_value 格式的 df）
+            - calculation_func: Your indicator function (should return df in timestamp/indicator_name/indicator_value format)
             """
             use_multiprocessing = True
 
@@ -362,17 +370,17 @@ class Finstore:
             )
 
     # ============================================================
-    # Stream：流式落盘模块（接收外部消息 message，自己不去连交易所）
+    # Stream: Streaming ingestion module (Receives external messages, does NOT connect to exchange)
     # ============================================================
     class Stream:
         """
-        Stream 模块用于实时落盘，但它不是交易所客户端：
+        Stream module is for real-time persistence, but it is NOT an exchange client:
 
-        ✅ 你把交易所 websocket/REST 获取到的 message(dict) 传进来
-        ✅ 这里根据 preset/parse_func 解析为统一格式并写 parquet
-        ❌ 这里不维护 websocket 连接、不请求交易所、不处理鉴权
+        ✅ You pass in the message(dict) obtained from exchange websocket/REST.
+        ✅ Parses into unified format based on preset/parse_func and writes to parquet.
+        ❌ Does NOT maintain websocket connections, request exchanges, or handle auth.
 
-        所以它与交易所 API 是解耦的：采集层和存储层分离。
+        Thus it is decoupled from Exchange APIs: separation of collection layer and storage layer.
         """
 
         def __init__(self, finstore_instance):
@@ -381,9 +389,9 @@ class Finstore:
             self.base_directory = finstore_instance.base_directory
             self.enable_append = finstore_instance.enable_append
 
-        # 预设解析器：把“交易所消息结构”映射到你的统一 schema
+        # Preset parsers: map 'exchange message structure' to your unified schema
         PRESET_CONFIGS = {
-            # Binance kline 消息 -> OHLCV 行
+            # Binance kline message -> OHLCV row
             'binance_kline': lambda message: {
                 'timestamp': message['k']['t'],
                 'open': float(message['k']['o']),
@@ -392,11 +400,11 @@ class Finstore:
                 'close': float(message['k']['c']),
                 'volume': float(message['k']['v']),
                 'buy_volume': float(message['k']['V']),
-                # dedup 用于去重：kline 开始时间
+                # dedup used for deduplication: kline start time
                 'dedup': message['k']['t'],
             },
 
-            # Binance aggTrade 消息 -> 成交行
+            # Binance aggTrade message -> Trade row
             'agg_trade': lambda message: {
                 'event_type': message['e'],
                 'event_time': message['E'],
@@ -408,7 +416,7 @@ class Finstore:
                 'last_trade_id': message['l'],
                 'trade_time': message['T'],
                 'is_buyer_maker': message['m'],
-                # dedup 用于去重：聚合成交 id
+                # dedup used for deduplication: aggregate trade id
                 'dedup': message['a'],
             },
         }
@@ -422,16 +430,16 @@ class Finstore:
             save_raw_data: bool = True
         ):
             """
-            保存“外部传入的一条消息”到 parquet
+            Save 'one externally passed message' to parquet.
 
-            重点：
-            - message 的来源不在这里：通常来自你写的交易所采集器（websocket回调等）
-            - 这里的职责：解析 -> 去重 -> 追加写 parquet
+            Key points:
+            - The source of the message is not here: usually comes from your exchange collector (websocket callbacks, etc.)
+            - Responsibility here: Parse -> Deduplicate -> Append write to parquet
 
-            参数：
-            - parse_func: 自定义解析函数（message -> dict row）
-            - preset: 预设解析器名（如 'binance_kline'）
-            - save_raw_data: 是否同时保存原始 message 到 raw_data.parquet
+            Parameters:
+            - parse_func: Custom parse function (message -> dict row)
+            - preset: Preset parser name (e.g., 'binance_kline')
+            - save_raw_data: Whether to save raw message to raw_data.parquet
             """
             dir_path = os.path.join(
                 self.base_directory,
@@ -443,23 +451,23 @@ class Finstore:
 
             file_path = os.path.join(dir_path, 'ohlcv_data.parquet')
 
-            # 选择解析器：preset 优先
+            # Select parser: preset takes precedence
             if preset and preset in self.PRESET_CONFIGS:
                 parse_func = self.PRESET_CONFIGS[preset]
 
-            # 解析 message 为 1 行 DataFrame
+            # Parse message into a 1-row DataFrame
             if parse_func:
                 df = pd.DataFrame([parse_func(message)])
             else:
-                # 没提供解析器就原样保存（字段不一定统一）
+                # If no parser provided, save as is (fields may not be unified)
                 df = pd.DataFrame([message])
 
-            # 增量追加 + 去重
+            # Incremental append + deduplicate
             if os.path.isfile(file_path) and self.enable_append:
                 existing_df = pd.read_parquet(file_path)
                 df = pd.concat([existing_df, df], ignore_index=True)
 
-                # 去重逻辑：优先 timestamp，否则用 dedup
+                # Deduplication logic: prioritize timestamp, otherwise use dedup
                 if 'timestamp' in df.columns:
                     df = df.drop_duplicates(subset=['timestamp'], keep='last')
                 elif 'dedup' in df.columns:
@@ -467,7 +475,7 @@ class Finstore:
 
             df.to_parquet(file_path, index=False, compression='zstd')
 
-            # 可选：保存原始消息（用于审计/回放/排查）
+            # Optional: Save raw message (for audit/replay/troubleshooting)
             if save_raw_data:
                 df_raw = pd.DataFrame([message])
                 raw_path = os.path.join(dir_path, 'raw_data.parquet')
@@ -480,7 +488,7 @@ class Finstore:
 
         def fetch_trade_data(self, symbol: str) -> pd.DataFrame:
             """
-            读取某个 symbol 的 ohlcv_data.parquet 并返回 DataFrame
+            Read ohlcv_data.parquet for a specific symbol and return DataFrame
             """
             file_path = os.path.join(
                 self.base_directory,
