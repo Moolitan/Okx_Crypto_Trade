@@ -6,4 +6,10 @@ pandas>=1.4
 python-dotenv>=1.0
 
 # ---- OKX 官方 SDK ----
-python-okx ==0.4.0
+python-okx==0.4.0
+
+# ---- 数据库存储 ----
+duckdb>=0.8.0
+
+# ---- 进度条显示 ----
+tqdm>=4.64.0
