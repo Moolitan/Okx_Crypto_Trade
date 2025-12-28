@@ -35,7 +35,7 @@ def _to_ts_ms(series: pd.Series) -> pd.Series:
     # 1. Already datetime64
     if pd.api.types.is_datetime64_any_dtype(series):
         dt = series.dt.tz_localize("UTC") if series.dt.tz is None else series.dt.tz_convert("UTC")
-        return (dt.view("int64") // 1_000_000).astype("int64")
+        return (dt.astype("int64") // 1_000_000).astype("int64")
 
     # 2. Numeric (Heuristic detection)
     if pd.api.types.is_numeric_dtype(series):
@@ -52,8 +52,6 @@ def _to_ts_ms(series: pd.Series) -> pd.Series:
         return s
 
     # 3. Strings / Objects (ISO format parsing)
-    dt = pd.to_datetime(series, utc=True, errors="coerce")
-    # Handle failures (Nat) by defaulting to 0 or keeping NaT logic (here we force int)
     dt = pd.to_datetime(series, utc=True, errors="coerce")
     return (dt.astype("int64") // 1_000_000).fillna(0).astype("int64")
 
@@ -245,8 +243,8 @@ class OkxPersistStore:
         return out[["timestamp", "open", "high", "low", "close", "volume"]]
 
     def _export_ohlcv_parquet(self, symbol: str, bar: str):
-        os.makedirs(out_dir, exist_ok=True)
         out_dir = os.path.join(self.parquet_dir, "ohlcv")
+        os.makedirs(out_dir, exist_ok=True)
         with self._lock:
             self.con.execute(
                 f"""
