@@ -1,19 +1,20 @@
 # data/okx/data.py
+from __future__ import annotations
+
 import time
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 from collections import deque
 
 import pandas as pd
 
-# ✅ Unified imports:
 # Prefer package-relative imports; fall back to local imports for direct script execution
 try:
     from .core import OkxBaseMixin
-    from .store import OkxPersistStore
 except Exception:
     from core import OkxBaseMixin
-    from store import OkxPersistStore
+
 
 logger = logging.getLogger("OkxMarketDataBus")
 if not logger.handlers:
@@ -25,19 +26,17 @@ if not logger.handlers:
 
 class MarketDataBus(OkxBaseMixin):
     """
-    Unified OKX market data bus.
+    Unified OKX market data bus (in-memory only).
 
     Responsibilities:
     - Collect incoming market data
     - Cache data in memory (OHLCV, order book, trades, sentiment, etc.)
-    - Persist data to storage (DuckDB via OkxPersistStore)
     - Expose read-only interfaces for downstream consumers (e.g., indicators, strategies)
 
     Notes:
-    - In-memory buffers: K-lines, order book, trades, sentiment
-    - Persistence layer: DuckDB (OkxPersistStore)
-    - ❌ No runtime state (RuntimeState). Runtime/strategy state should live in an external
-      state.py or in the strategy process itself.
+    - No persistence here. Persist/query are handled by data/okx/store.py (OkxPersistStore).
+    - No runtime state object. Strategy/runtime state should live in an external state.py
+      or in the strategy process itself.
     """
 
     def __init__(
@@ -48,18 +47,19 @@ class MarketDataBus(OkxBaseMixin):
         sleep_s: float = 0.05,
         max_klines_mem: int = 5000,
         max_trades_mem: int = 5000,
-        persist_path: str = "./data/okx.duckdb",
         bar: str = "1m",
     ):
         super().__init__(flag=flag, sleep_s=sleep_s)
 
         self.exchange = exchange
         self.base_symbol = base_symbol
-        # Keep bar interval directly on the bus (not a runtime state object)
         self.bar = bar
 
         self.now_ts: float = time.time()
         self.last_update_ts: float = self.now_ts
+
+        # Thread safety: protect in-memory state
+        self._lock = threading.RLock()
 
         # K-line buffer
         self._kline_cols = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -70,7 +70,10 @@ class MarketDataBus(OkxBaseMixin):
         self.bid_price: Optional[float] = None
         self.ask_price: Optional[float] = None
 
+        # Order book snapshot
         self.order_book: Dict[str, List] = {"bids": [], "asks": []}
+
+        # Trades (raw trades)
         self.trades: deque = deque(maxlen=max_trades_mem)
 
         # Derivatives-related data
@@ -95,8 +98,11 @@ class MarketDataBus(OkxBaseMixin):
         self.top_volume_24h: List[Dict] = []
         self.funding_rates: Dict[str, float] = {}
 
-        # Persistence backend
-        self.store = OkxPersistStore(path=persist_path)
+        if not self.base_symbol:
+            logger.warning(
+                "MarketDataBus initialized with empty base_symbol. "
+                "Pass base_symbol like 'BTC-USDT-SWAP' for consistency."
+            )
 
         logger.info(
             f"MarketDataBus initialized exchange={exchange}, symbol={base_symbol}, bar={bar}"
@@ -121,48 +127,78 @@ class MarketDataBus(OkxBaseMixin):
         - low
         - close
         - volume
+
+        Note:
+        - This method only updates in-memory cache; no DB writes here.
         """
         if not kline_row or "timestamp" not in kline_row:
             return
 
         cleaned = {k: kline_row.get(k) for k in self._kline_cols}
-        self._kline_buffer.append(cleaned)
-        self._touch()
-
-        # If you want to persist only on bar close, keep this hook
-        if is_closed is True:
-            self.persist_ohlcv_latest()
+        with self._lock:
+            self._kline_buffer.append(cleaned)
+            self._touch()
 
     def update_ticker(self, price: float, bid: float = None, ask: float = None):
-        if price is not None:
-            self.last_price = float(price)
-        if bid is not None:
-            self.bid_price = float(bid)
-        if ask is not None:
-            self.ask_price = float(ask)
-        self._touch()
+        with self._lock:
+            if price is not None:
+                self.last_price = float(price)
+            if bid is not None:
+                self.bid_price = float(bid)
+            if ask is not None:
+                self.ask_price = float(ask)
+            self._touch()
 
     def update_order_book(self, bids: List, asks: List):
+        """
+        Update L2 order book snapshot.
+
+        Expected formats (typical):
+          bids/asks = [[price, size, ...], ...]
+        """
         try:
-            self.order_book["bids"] = [[float(p), float(s)] for p, s, *_ in bids]
-            self.order_book["asks"] = [[float(p), float(s)] for p, s, *_ in asks]
-            self._touch()
+            parsed_bids = [[float(p), float(s)] for p, s, *_ in bids]
+            parsed_asks = [[float(p), float(s)] for p, s, *_ in asks]
+            with self._lock:
+                self.order_book["bids"] = parsed_bids
+                self.order_book["asks"] = parsed_asks
+                self._touch()
         except Exception as e:
             logger.error(f"Error updating order book: {e}")
 
     def update_trade(self, trade: Dict[str, Any]):
-        if trade:
-            self.trades.append(trade)
+        """
+        Ingest a trade (raw).
+
+        Canonical recommended keys for downstream/persistence:
+          - trade_id (string)
+          - px (or price)
+          - sz (or size)
+          - side ('buy'/'sell')
+          - ts (or timestamp)
+
+        If upstream provides OKX-native keys (tradeId), normalize to trade_id in-memory.
+        """
+        if not trade:
+            return
+
+        t = dict(trade)
+        if "trade_id" not in t and "tradeId" in t:
+            t["trade_id"] = t.get("tradeId")
+
+        with self._lock:
+            self.trades.append(t)
             self._touch()
 
     def update_sentiment(self, data_dict: Dict[str, Any]):
         if not data_dict:
             return
-        self.sentiment_data.update(data_dict)
-        self._touch()
+        with self._lock:
+            self.sentiment_data.update(data_dict)
+            self._touch()
 
     # -------------------------
-    # Read Interfaces (For Indicators)
+    # Read Interfaces
     # -------------------------
 
     def get_klines_df(self) -> pd.DataFrame:
@@ -170,10 +206,10 @@ class MarketDataBus(OkxBaseMixin):
         Convert the in-memory K-line buffer to a pandas DataFrame.
         This is the primary data source for indicator calculations.
         """
-        if not self._kline_buffer:
-            return pd.DataFrame(columns=self._kline_cols)
-
-        df = pd.DataFrame(list(self._kline_buffer), columns=self._kline_cols)
+        with self._lock:
+            if not self._kline_buffer:
+                return pd.DataFrame(columns=self._kline_cols)
+            df = pd.DataFrame(list(self._kline_buffer), columns=self._kline_cols)
 
         for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
@@ -182,44 +218,35 @@ class MarketDataBus(OkxBaseMixin):
         return df
 
     def get_latest_kline(self) -> Optional[Dict[str, Any]]:
-        return self._kline_buffer[-1] if self._kline_buffer else None
+        with self._lock:
+            return self._kline_buffer[-1] if self._kline_buffer else None
+
+    def get_trades_df(self) -> pd.DataFrame:
+        """
+        Return trades as a DataFrame for persistence/analysis.
+        """
+        with self._lock:
+            if not self.trades:
+                return pd.DataFrame()
+            return pd.DataFrame(list(self.trades))
 
     def get_mid_price(self) -> Optional[float]:
-        if self.bid_price is not None and self.ask_price is not None:
-            return (self.bid_price + self.ask_price) / 2
-        return self.last_price
+        with self._lock:
+            if self.bid_price is not None and self.ask_price is not None:
+                return (self.bid_price + self.ask_price) / 2
+            return self.last_price
 
     def get_order_book_imbalance(self, depth: int = 5) -> float:
-        if not self.order_book["bids"] or not self.order_book["asks"]:
-            return 0.0
-
-        bids = self.order_book["bids"][:depth]
-        asks = self.order_book["asks"][:depth]
+        with self._lock:
+            if not self.order_book["bids"] or not self.order_book["asks"]:
+                return 0.0
+            bids = self.order_book["bids"][:depth]
+            asks = self.order_book["asks"][:depth]
 
         bid_vol = sum(b[1] for b in bids)
         ask_vol = sum(a[1] for a in asks)
         denom = bid_vol + ask_vol
-
         return 0.0 if denom == 0 else (bid_vol - ask_vol) / denom
-
-    # -------------------------
-    # Persistence
-    # -------------------------
-
-    def persist_ohlcv_latest(self, *, bar: Optional[str] = None):
-        """
-        Upsert OHLCV data from the current in-memory buffer into DuckDB.
-        Deduplication is handled by primary keys at the storage layer.
-        """
-        if not self.store:
-            return
-
-        df = self.get_klines_df()
-        if df.empty:
-            return
-
-        use_bar = bar or self.bar or "1m"
-        self.store.upsert_ohlcv(symbol=self.base_symbol, bar=use_bar, df=df)
 
     # -------------------------
     # Snapshot
@@ -230,19 +257,21 @@ class MarketDataBus(OkxBaseMixin):
         Return a lightweight snapshot of the latest market state.
         Useful for logging, monitoring, or strategy-level debugging.
         """
-        snap = {
-            "exchange": self.exchange,
-            "symbol": self.base_symbol,
-            "ts": self.now_ts,
-            "bar": self.bar,
-            "price": self.last_price,
-            "funding": self.funding_rate,
-            "ob_imbalance": self.get_order_book_imbalance(),
-        }
-        snap.update(self.sentiment_data)
+        with self._lock:
+            snap = {
+                "exchange": self.exchange,
+                "symbol": self.base_symbol,
+                "ts": self.now_ts,
+                "bar": self.bar,
+                "price": self.last_price,
+                "funding": self.funding_rate,
+                "ob_imbalance": self.get_order_book_imbalance(),
+            }
+            snap.update(dict(self.sentiment_data))
         return snap
 
     def close(self):
-        logger.info("Closing MarketDataBus...")
-        if self.store:
-            self.store.close()
+        """
+        In-memory bus close hook. No persistence here.
+        """
+        logger.info("Closing MarketDataBus (in-memory only)...")

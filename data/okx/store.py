@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 
 import pandas as pd
 import numpy as np
@@ -34,25 +34,20 @@ def _to_ts_ms(series: pd.Series) -> pd.Series:
     if series.empty:
         return series.astype("int64")
 
-    # 1) Already datetime64
+    # 1) datetime64
     if pd.api.types.is_datetime64_any_dtype(series):
         dt = series.dt.tz_localize("UTC") if series.dt.tz is None else series.dt.tz_convert("UTC")
         return (dt.astype("int64") // 1_000_000).astype("int64")
 
-    # 2) Numeric (heuristic detection: seconds vs ms)
+    # 2) numeric heuristic: seconds vs ms
     if pd.api.types.is_numeric_dtype(series):
         s = series.fillna(0).astype("int64")
         sample = int(s.iloc[0]) if len(s) > 0 else 0
-
-        # Heuristic:
-        # - seconds around year 2286 ~ 1e10
-        # - milliseconds around year 1973 ~ 1e11
-        # If < 1e11, assume seconds
-        if 0 < sample < 100_000_000_000:
+        if 0 < sample < 100_000_000_000:  # < 1e11 => seconds
             return (s * 1000).astype("int64")
         return s
 
-    # 3) Strings / Objects (ISO parsing)
+    # 3) strings/objects
     dt = pd.to_datetime(series, utc=True, errors="coerce")
     return (dt.astype("int64") // 1_000_000).fillna(0).astype("int64")
 
@@ -62,10 +57,23 @@ def _ts_ms_to_iso(ts_ms: pd.Series) -> pd.Series:
     return dt.astype(str)
 
 
+def _bar_to_seconds(bar: str) -> int:
+    """
+    Convert a bar string like '1m', '5m', '1h' to seconds.
+    """
+    bar = (bar or "1m").strip().lower()
+    mapping = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
+    return mapping.get(bar, 60)
+
+
 @dataclass
 class OkxPersistStore:
     """
-    Persistence layer (DuckDB as primary store, optional Parquet export).
+    Persistence/query layer (DuckDB as primary store, optional Parquet export).
+
+    This module should:
+    - initialize schema (when not read_only)
+    - provide append/upsert and query methods
     """
 
     path: Optional[str] = None
@@ -101,8 +109,12 @@ class OkxPersistStore:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    # -----------------------
+    # Schema
+    # -----------------------
+
     def _init_schema(self):
-        # OHLCV: Primary Key effectively (symbol, bar, ts_ms)
+        # OHLCV: Primary Key (symbol, bar, ts_ms)
         self.con.execute(
             """
             CREATE TABLE IF NOT EXISTS ohlcv (
@@ -168,7 +180,7 @@ class OkxPersistStore:
         )
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_signals ON signals(strategy, symbol, ts_ms);")
 
-        # Market Trades (for Footprint Chart)
+        # Market trades (tick-level; for footprint)
         self._init_market_trades_schema()
 
     def _init_market_trades_schema(self) -> None:
@@ -177,9 +189,8 @@ class OkxPersistStore:
 
         Strategy:
         1) Prefer UNIQUE constraint in CREATE TABLE.
-        2) Fallback to UNIQUE INDEX if constraint syntax/enforcement is unsupported.
+        2) Fallback to UNIQUE INDEX if constraint syntax/enforcement is unsupported by the DuckDB version.
         """
-        # Try table with UNIQUE constraint first
         try:
             self.con.execute(
                 """
@@ -195,7 +206,6 @@ class OkxPersistStore:
                 """
             )
         except Exception:
-            # Fallback: create table without constraint
             self.con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS market_trades (
@@ -209,24 +219,20 @@ class OkxPersistStore:
                 """
             )
 
-        # Time-based index for fast aggregations
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_mkt_trades_ts ON market_trades(symbol, ts_ms);")
-
-        # Fallback uniqueness enforcement via UNIQUE INDEX (if supported)
         try:
-            self.con.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_mkt_trades_uniq ON market_trades(symbol, trade_id);"
-            )
+            self.con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mkt_trades_uniq ON market_trades(symbol, trade_id);")
         except Exception:
             pass
 
     # -----------------------
-    # OHLCV (Optimized Upsert)
+    # OHLCV
     # -----------------------
 
     def upsert_ohlcv(self, symbol: str, bar: str, df: pd.DataFrame) -> None:
         """
-        Upsert OHLCV bars using DuckDB ON CONFLICT upsert.
+        Upsert OHLCV bars using DuckDB ON CONFLICT.
+        Expected columns: timestamp, open, high, low, close, volume
         """
         if df is None or df.empty:
             return
@@ -259,9 +265,6 @@ class OkxPersistStore:
             )
             self.con.unregister("ohlcv_in")
 
-        if self.parquet_dir:
-            self._export_ohlcv_parquet(symbol=symbol, bar=bar)
-
     def load_ohlcv(
         self,
         symbol: str,
@@ -288,35 +291,14 @@ class OkxPersistStore:
             out = self.con.execute(q, params).df()
 
         if out.empty:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "identifier"])
 
         out["timestamp"] = _ts_ms_to_iso(out["ts_ms"])
         out["identifier"] = out["timestamp"]
         return out
 
-    def _export_ohlcv_parquet(self, symbol: str, bar: str):
-        out_dir = os.path.join(self.parquet_dir, "ohlcv")
-        os.makedirs(out_dir, exist_ok=True)
-        with self._lock:
-            self.con.execute(
-                f"""
-                COPY (
-                    SELECT
-                        symbol,
-                        bar,
-                        ts_ms,
-                        open, high, low, close, volume,
-                        strftime(to_timestamp(ts_ms/1000), '%Y-%m-%d') AS date
-                    FROM ohlcv
-                    WHERE symbol='{symbol}' AND bar='{bar}'
-                )
-                TO '{out_dir}'
-                (FORMAT PARQUET, PARTITION_BY (symbol, bar, date), OVERWRITE_OR_IGNORE 1);
-                """
-            )
-
     # -----------------------
-    # Market Trades (Unique by symbol + trade_id)
+    # Market Trades (tick-level)
     # -----------------------
 
     def append_market_trades(self, symbol: str, df: pd.DataFrame) -> None:
@@ -328,33 +310,28 @@ class OkxPersistStore:
           - trade_id
           - px or price
           - sz or size
-          - side  (e.g., 'buy'/'sell')
+          - side
 
-        Data hygiene:
-          - Rows with missing/empty trade_id are dropped (uniqueness requires a real id).
-          - Rows with missing timestamps are dropped (cannot bucket/aggregate).
-
-        Uniqueness:
-          - Enforced by (symbol, trade_id) via UNIQUE constraint or UNIQUE INDEX (depending on DuckDB version).
-          - Preferred insert path: ON CONFLICT DO NOTHING.
-          - Fallback insert path: anti-join to avoid duplicates.
+        Notes:
+          - Rows with missing/empty trade_id are dropped.
+          - Rows with invalid timestamps are dropped.
+          - Uniqueness enforced by (symbol, trade_id) via constraint/index.
         """
         if df is None or df.empty:
             return
 
         tmp = df.copy()
 
-        # Support different timestamp column names
+        # Timestamp normalization
         if "timestamp" in tmp.columns:
             tmp["ts_ms"] = _to_ts_ms(tmp["timestamp"])
         elif "ts" in tmp.columns:
             tmp["ts_ms"] = _to_ts_ms(tmp["ts"])
         else:
-            return  # No usable timestamp column
+            return  # no usable timestamp column
 
-        # Standardize common column aliases
-        col_map = {"px": "price", "size": "sz"}
-        tmp.rename(columns=col_map, inplace=True)
+        # Standardize aliases
+        tmp.rename(columns={"px": "price", "size": "sz"}, inplace=True)
 
         tmp["symbol"] = symbol
 
@@ -365,14 +342,12 @@ class OkxPersistStore:
 
         insert_df = tmp[req_cols].copy()
 
-        # ---- Data hygiene / filtering ----
-        # 1) Drop rows with invalid timestamps (0 is produced by _to_ts_ms when parsing fails)
+        # Drop invalid ts
         insert_df = insert_df[insert_df["ts_ms"].notna()]
         insert_df["ts_ms"] = insert_df["ts_ms"].astype("int64")
         insert_df = insert_df[insert_df["ts_ms"] > 0]
 
-        # 2) Drop rows with missing/empty trade_id
-        # (UNIQUE with NULL doesn't behave as "dedup"; most SQL engines allow multiple NULLs)
+        # Drop invalid trade_id
         insert_df["trade_id"] = insert_df["trade_id"].astype(str)
         insert_df = insert_df[insert_df["trade_id"].notna()]
         insert_df = insert_df[insert_df["trade_id"].str.strip() != ""]
@@ -382,12 +357,10 @@ class OkxPersistStore:
         if insert_df.empty:
             return
 
-        # Optional: normalize side values to lower-case for consistent aggregation
         insert_df["side"] = insert_df["side"].astype(str).str.lower()
 
         with self._lock:
             self.con.register("trades_in", insert_df)
-
             try:
                 self.con.execute(
                     """
@@ -397,7 +370,6 @@ class OkxPersistStore:
                     """
                 )
             except Exception:
-                # Compatibility fallback: anti-join insert
                 self.con.execute(
                     """
                     INSERT INTO market_trades
@@ -408,31 +380,29 @@ class OkxPersistStore:
                     WHERE m.trade_id IS NULL;
                     """
                 )
-
             self.con.unregister("trades_in")
+
+    # -----------------------
+    # Footprint aggregation
+    # -----------------------
 
     def load_footprint_data(
         self,
         symbol: str,
-        bar_seconds: int = 60,
+        bar: str = "1m",
         limit: int = 100,
     ) -> pd.DataFrame:
         """
-        Core method: compute Footprint (price-by-volume) data directly inside DuckDB.
+        Compute Footprint (price-by-volume) data inside DuckDB.
 
-        Args:
-            symbol: Trading pair / instrument symbol
-            bar_seconds: Bar interval in seconds (1m = 60)
-            limit: Number of most recent bars to load
-
-        Returns:
-            DataFrame with columns:
-              - identifier (ISO timestamp for the bar bucket)
-              - price
-              - bid_size  (aggressive sells)
-              - ask_size  (aggressive buys)
-              - trade_count
+        Returns DataFrame columns:
+          - identifier (ISO timestamp of the bucket)
+          - price
+          - bid_size  (aggressive sells)
+          - ask_size  (aggressive buys)
+          - trade_count
         """
+        bar_seconds = _bar_to_seconds(bar)
         interval_ms = int(bar_seconds) * 1000
 
         query = f"""
@@ -471,78 +441,3 @@ class OkxPersistStore:
         df["identifier"] = _ts_ms_to_iso(df["bucket_ts"])
         df = df.drop(columns=["bucket_ts"])
         return df
-
-    # -----------------------
-    # Funding history
-    # -----------------------
-
-    def append_funding_history(self, symbol: str, df: pd.DataFrame) -> None:
-        if df is None or df.empty:
-            return
-
-        tmp = df.copy()
-        tmp["ts_ms"] = _to_ts_ms(tmp["timestamp"])
-        tmp["symbol"] = symbol
-        if "realized_rate" not in tmp.columns:
-            tmp["realized_rate"] = None
-
-        insert_df = tmp[["symbol", "ts_ms", "funding_rate", "realized_rate"]]
-
-        with self._lock:
-            self.con.register("fund_in", insert_df)
-            self.con.execute(
-                """
-                INSERT INTO funding
-                SELECT symbol, ts_ms, funding_rate, realized_rate FROM fund_in
-                ON CONFLICT (symbol, ts_ms) DO UPDATE SET
-                    funding_rate = EXCLUDED.funding_rate,
-                    realized_rate = EXCLUDED.realized_rate;
-                """
-            )
-            self.con.unregister("fund_in")
-
-        if self.parquet_dir:
-            # Optional export logic can be added here
-            pass
-
-    # -----------------------
-    # Fills / Signals (Append Only)
-    # -----------------------
-
-    def append_fills(self, df: pd.DataFrame) -> None:
-        if df is None or df.empty:
-            return
-
-        tmp = df.copy()
-        tmp["ts_ms"] = _to_ts_ms(tmp["timestamp"])
-        if "extra_json" not in tmp.columns:
-            tmp["extra_json"] = None
-
-        cols = ["strategy", "symbol", "ts_ms", "order_id", "side", "price", "qty", "fee", "fee_ccy", "extra_json"]
-        for c in cols:
-            if c not in tmp.columns:
-                tmp[c] = None
-
-        with self._lock:
-            self.con.register("fills_in", tmp[cols])
-            self.con.execute("INSERT INTO fills SELECT * FROM fills_in;")
-            self.con.unregister("fills_in")
-
-    def append_signals(self, df: pd.DataFrame) -> None:
-        if df is None or df.empty:
-            return
-
-        tmp = df.copy()
-        tmp["ts_ms"] = _to_ts_ms(tmp["timestamp"])
-        if "extra_json" not in tmp.columns:
-            tmp["extra_json"] = None
-
-        cols = ["strategy", "symbol", "ts_ms", "signal_name", "value", "decision", "reason", "extra_json"]
-        for c in cols:
-            if c not in tmp.columns:
-                tmp[c] = None
-
-        with self._lock:
-            self.con.register("sig_in", tmp[cols])
-            self.con.execute("INSERT INTO signals SELECT * FROM sig_in;")
-            self.con.unregister("sig_in")
