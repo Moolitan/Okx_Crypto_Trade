@@ -103,6 +103,62 @@ class QuantitativeIndicator:
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
+    
+
+    def compute_all(
+        self,
+        df: Optional[pd.DataFrame] = None,
+        *,
+        sentiment_data: Optional[Dict[str, Any]] = None,
+        write_back: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Compute a standard indicator feature-set on OHLCV.
+
+        - df: OHLCV dataframe with columns: timestamp, open, high, low, close, volume
+        - sentiment_data: optional dict for sentiment_features()
+        - write_back: if True, returns OHLCV + all indicator columns
+        """
+        base = self._get_df(df)
+        base = self._ensure_ohlcv(base).copy()
+
+        # Keep timestamp if provided (your _ensure_ohlcv doesn't enforce it; that's fine)
+        out = base
+
+        # Trend / volatility
+        out = self.ma(out, write_back=True)                 # MA_fast/MA_slow
+        out = self.ema(out, write_back=True)                # EMA_fast/EMA_slow (optional but useful)
+        out = self.boll(out, write_back=True)               # BOLL_mid/up/low
+        out = self.atr(out, write_back=True, col_name="ATR")# ATR
+        out = self.supertrend_bands(out, write_back=True)   # SuperTrend_Upper/Lower (bands only)
+        out = self.support_resistance(out, write_back=True) # Res_Line/Sup_Line
+
+        # Momentum / oscillators
+        out = self.rsi(out, write_back=True, col_name="RSI")
+        out = self.macd(out, write_back=True)
+        out = self.kdj(out, write_back=True)
+        out = self.wr(out, write_back=True, col_name="WR")
+        out = self.roc(out, write_back=True, col_name="ROC")
+        out = self.mtm(out, write_back=True, col_name="MTM")
+        out = self.cci(out, write_back=True, col_name="CCI")
+        out = self.stoch_rsi(out, write_back=True, col_name="StochRSI")
+
+        # Volume
+        out = self.obv(out, write_back=True, col_name="OBV")
+        out = self.vr(out, write_back=True, col_name="VR")
+
+        # Misc
+        out = self.psy(out, write_back=True, col_name="PSY")
+
+        # Sentiment (optional)
+        if sentiment_data is not None:
+            out = self.sentiment_features(out, sentiment=sentiment_data, write_back=True)
+        else:
+            # If bus has sentiment_data, this will broadcast it; otherwise it does nothing.
+            out = self.sentiment_features(out, sentiment=None, write_back=True)
+
+        return out if write_back else out.copy()
+
 
     # -------------------------
     # Trend indicators
